@@ -1,0 +1,528 @@
+  1 """
+    2 Candidate Assessment Model for AI Teams
+    3
+    4 Logistic Regression model to predict offer probability based on pre-onsite interviews.
+    5 """
+    6
+    7 import numpy as np
+    8 import pandas as pd
+    9 from sklearn.model_selection import train_test_split, cross_val_score
+   10 from sklearn.linear_model import LogisticRegression
+   11 from sklearn.preprocessing import StandardScaler
+   12 from sklearn.metrics import (
+   13     roc_auc_score, classification_report, confusion_matrix,
+   14     roc_curve, precision_recall_curve, brier_score_loss
+   15 )
+   16 from sklearn.calibration import calibration_curve
+   17 import matplotlib.pyplot as plt
+   18 import seaborn as sns
+   19 from typing import Dict, List, Tuple
+   20 import pickle
+   21 from datetime import datetime
+   22 from data_schema import PredictionResult
+   23
+   24
+   25 class CandidateAssessmentModel:
+   26     """
+   27     Predicts candidate offer probability based on pre-onsite interview performance
+   28     """
+   29
+   30     def __init__(self):
+   31         self.model = None
+   32         self.scaler = StandardScaler()
+   33         self.feature_names = None
+   34         self.feature_importance = None
+   35         self.training_date = None
+   36         self.model_metrics = {}
+   37
+   38     def engineer_features(self, df: pd.DataFrame) -> pd.DataFrame:
+   39         """
+   40         Create derived features from raw interview scores
+   41         """
+   42         df = df.copy()
+   43
+   44         # Aggregate ML fundamentals score
+   45         ml_cols = [
+   46             'ml_theory_score', 'statistics_score', 'deep_learning_score',
+   47             'model_evaluation_score', 'practical_application_score'
+   48         ]
+   49         df['ml_fundamentals_avg'] = df[ml_cols].mean(axis=1)
+   50         df['ml_fundamentals_min'] = df[ml_cols].min(axis=1)
+   51         df['ml_fundamentals_std'] = df[ml_cols].std(axis=1)
+   52
+   53         # Aggregate coding rubric scores (the 4 core criteria)
+   54         coding_rubric_cols = [
+   55             'workable_solution_score', 'time_efficiency_score',
+   56             'code_cleanliness_score', 'algorithmic_efficiency_score'
+   57         ]
+   58         df['coding_rubric_avg'] = df[coding_rubric_cols].mean(axis=1)
+   59         df['coding_rubric_min'] = df[coding_rubric_cols].min(axis=1)
+   60         df['coding_rubric_std'] = df[coding_rubric_cols].std(axis=1)
+   61
+   62         # Additional coding signals
+   63         coding_additional_cols = [
+   64             'debugging_ability_score', 'edge_case_handling_score',
+   65             'testing_approach_score'
+   66         ]
+   67         df['coding_additional_avg'] = df[coding_additional_cols].mean(axis=1)
+   68
+   69         # Overall technical strength
+   70         df['combined_technical_avg'] = (df['ml_fundamentals_avg'] + df['coding_rubric_avg']) / 2
+   71
+   72         # Communication across both rounds
+   73         df['communication_avg'] = (df['ml_communication_score'] + df['coding_communication_score']) / 2
+   74
+   75         # Interviewer confidence average
+   76         df['interviewer_confidence_avg'] = (
+   77             df['ml_interviewer_confidence'] + df['coding_interviewer_confidence']
+   78         ) / 2
+   79
+   80         # Problem solving composite
+   81         df['problem_solving_composite'] = (
+   82             df['ml_problem_approach_score'] + df['coding_solution_design_score'] +
+   83             df['coding_problem_understanding_score']
+   84         ) / 3
+   85
+   86         # Success rate on coding problems
+   87         df['coding_success_rate'] = df['problems_solved'] / df['problems_attempted'].replace(0, 1)
+   88
+   89         # Flag for consistently high performer
+   90         df['consistently_high'] = (
+   91             (df['ml_fundamentals_min'] >= 3.5) &
+   92             (df['coding_rubric_min'] >= 3.5)
+   93         ).astype(int)
+   94
+   95         # Flag for any red flags (very low scores)
+   96         df['has_red_flag'] = (
+   97             (df['ml_fundamentals_min'] < 2.5) |
+   98             (df['coding_rubric_min'] < 2.5)
+   99         ).astype(int)
+  100
+  101         # Experience composite
+  102         df['experience_composite'] = (
+  103             df['years_ml_experience'] +
+  104             df['has_phd'] * 2 +
+  105             df['previous_ai_role'] * 1.5 +
+  106             df['top_tier_company'] * 1
+  107         )
+  108
+  109         return df
+  110
+  111     def select_features(self) -> List[str]:
+  112         """
+  113         Select features for modeling
+  114         Returns list of feature column names
+  115         """
+  116         features = [
+  117             # Profile features
+  118             'years_experience',
+  119             'years_ml_experience',
+  120             'has_phd',
+  121             'has_masters',
+  122             'previous_ai_role',
+  123             'top_tier_company',
+  124             'research_publications',
+  125             'recruiter_screen_score',
+  126             'experience_composite',
+  127
+  128             # ML Fundamentals - raw scores
+  129             'ml_theory_score',
+  130             'statistics_score',
+  131             'deep_learning_score',
+  132             'model_evaluation_score',
+  133             'practical_application_score',
+  134             'ml_communication_score',
+  135             'ml_problem_approach_score',
+  136             'ml_overall_score',
+  137             'ml_interviewer_confidence',
+  138
+  139             # ML Fundamentals - aggregated
+  140             'ml_fundamentals_avg',
+  141             'ml_fundamentals_min',
+  142             'ml_fundamentals_std',
+  143
+  144             # Coding - core rubric
+  145             'workable_solution_score',
+  146             'time_efficiency_score',
+  147             'code_cleanliness_score',
+  148             'algorithmic_efficiency_score',
+  149
+  150             # Coding - additional
+  151             'debugging_ability_score',
+  152             'edge_case_handling_score',
+  153             'testing_approach_score',
+  154             'coding_problem_understanding_score',
+  155             'coding_solution_design_score',
+  156             'coding_communication_score',
+  157             'coding_collaboration_score',
+  158             'coding_overall_score',
+  159             'coding_interviewer_confidence',
+  160
+  161             # Coding - aggregated
+  162             'coding_rubric_avg',
+  163             'coding_rubric_min',
+  164             'coding_rubric_std',
+  165             'coding_additional_avg',
+  166             'coding_success_rate',
+  167
+  168             # Cross-round features
+  169             'combined_technical_avg',
+  170             'communication_avg',
+  171             'interviewer_confidence_avg',
+  172             'problem_solving_composite',
+  173             'consistently_high',
+  174             'has_red_flag',
+  175         ]
+  176
+  177         return features
+  178
+  179     def train(self, df: pd.DataFrame, test_size: float = 0.2, random_state: int = 42):
+  180         """
+  181         Train the logistic regression model
+  182         """
+  183         print("=" * 80)
+  184         print("TRAINING CANDIDATE ASSESSMENT MODEL")
+  185         print("=" * 80)
+  186
+  187         # Engineer features
+  188         df_processed = self.engineer_features(df)
+  189
+  190         # Select features
+  191         self.feature_names = self.select_features()
+  192
+  193         # Prepare X and y
+  194         X = df_processed[self.feature_names]
+  195         y = df_processed['offer_extended']
+  196
+  197         # Handle any missing values
+  198         X = X.fillna(X.median())
+  199
+  200         # Split data
+  201         X_train, X_test, y_train, y_test = train_test_split(
+  202             X, y, test_size=test_size, random_state=random_state, stratify=y
+  203         )
+  204
+  205         print(f"\nDataset split:")
+  206         print(f"  Training: {len(X_train)} candidates")
+  207         print(f"  Testing: {len(X_test)} candidates")
+  208         print(f"  Offer rate (train): {y_train.mean():.1%}")
+  209         print(f"  Offer rate (test): {y_test.mean():.1%}")
+  210
+  211         # Scale features
+  212         X_train_scaled = self.scaler.fit_transform(X_train)
+  213         X_test_scaled = self.scaler.transform(X_test)
+  214
+  215         # Train logistic regression with L2 regularization
+  216         print("\nTraining Logistic Regression model...")
+  217         self.model = LogisticRegression(
+  218             penalty='l2',
+  219             C=1.0,  # Regularization strength
+  220             solver='lbfgs',
+  221             max_iter=1000,
+  222             random_state=random_state,
+  223             class_weight='balanced'  # Handle class imbalance
+  224         )
+  225
+  226         self.model.fit(X_train_scaled, y_train)
+  227
+  228         # Feature importance (coefficient magnitudes)
+  229         self.feature_importance = pd.DataFrame({
+  230             'feature': self.feature_names,
+  231             'coefficient': self.model.coef_[0],
+  232             'abs_coefficient': np.abs(self.model.coef_[0])
+  233         }).sort_values('abs_coefficient', ascending=False)
+  234
+  235         # Evaluate model
+  236         print("\n" + "=" * 80)
+  237         print("MODEL EVALUATION")
+  238         print("=" * 80)
+  239
+  240         # Predictions
+  241         y_train_pred_proba = self.model.predict_proba(X_train_scaled)[:, 1]
+  242         y_test_pred_proba = self.model.predict_proba(X_test_scaled)[:, 1]
+  243
+  244         # AUC-ROC
+  245         train_auc = roc_auc_score(y_train, y_train_pred_proba)
+  246         test_auc = roc_auc_score(y_test, y_test_pred_proba)
+  247
+  248         print(f"\nAUC-ROC Score:")
+  249         print(f"  Training: {train_auc:.4f}")
+  250         print(f"  Testing:  {test_auc:.4f}")
+  251
+  252         # Brier score (calibration)
+  253         train_brier = brier_score_loss(y_train, y_train_pred_proba)
+  254         test_brier = brier_score_loss(y_test, y_test_pred_proba)
+  255
+  256         print(f"\nBrier Score (lower is better):")
+  257         print(f"  Training: {train_brier:.4f}")
+  258         print(f"  Testing:  {test_brier:.4f}")
+  259
+  260         # Cross-validation
+  261         cv_scores = cross_val_score(
+  262             self.model, X_train_scaled, y_train, cv=5, scoring='roc_auc'
+  263         )
+  264         print(f"\n5-Fold Cross-Validation AUC: {cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
+  265
+  266         # Classification report at 0.5 threshold
+  267         y_test_pred = (y_test_pred_proba >= 0.5).astype(int)
+  268         print("\nClassification Report (threshold=0.5):")
+  269         print(classification_report(y_test, y_test_pred, target_names=['No Offer', 'Offer']))
+  270
+  271         # Store metrics
+  272         self.model_metrics = {
+  273             'train_auc': train_auc,
+  274             'test_auc': test_auc,
+  275             'train_brier': train_brier,
+  276             'test_brier': test_brier,
+  277             'cv_auc_mean': cv_scores.mean(),
+  278             'cv_auc_std': cv_scores.std()
+  279         }
+  280
+  281         self.training_date = datetime.now()
+  282
+  283         # Store test data for visualization
+  284         self.X_test = X_test_scaled
+  285         self.y_test = y_test
+  286         self.y_test_pred_proba = y_test_pred_proba
+  287
+  288         print("\nModel training complete!")
+  289
+  290     def plot_feature_importance(self, top_n: int = 20):
+  291         """Plot top N most important features"""
+  292         if self.feature_importance is None:
+  293             raise ValueError("Model must be trained first")
+  294
+  295         plt.figure(figsize=(10, 8))
+  296         top_features = self.feature_importance.head(top_n)
+  297
+  298         colors = ['green' if x > 0 else 'red' for x in top_features['coefficient']]
+  299
+  300         plt.barh(range(len(top_features)), top_features['coefficient'], color=colors, alpha=0.7)
+  301         plt.yticks(range(len(top_features)), top_features['feature'])
+  302         plt.xlabel('Coefficient Value')
+  303         plt.title(f'Top {top_n} Most Important Features (Logistic Regression Coefficients)')
+  304         plt.axvline(x=0, color='black', linestyle='--', linewidth=0.8)
+  305         plt.gca().invert_yaxis()
+  306         plt.tight_layout()
+  307         plt.savefig('feature_importance.png', dpi=300, bbox_inches='tight')
+  308         print(f"Feature importance plot saved to feature_importance.png")
+  309         plt.close()
+  310
+  311     def plot_roc_curve(self):
+  312         """Plot ROC curve"""
+  313         if not hasattr(self, 'y_test'):
+  314             raise ValueError("Model must be trained first")
+  315
+  316         fpr, tpr, thresholds = roc_curve(self.y_test, self.y_test_pred_proba)
+  317         auc = roc_auc_score(self.y_test, self.y_test_pred_proba)
+  318
+  319         plt.figure(figsize=(8, 6))
+  320         plt.plot(fpr, tpr, label=f'ROC Curve (AUC = {auc:.3f})', linewidth=2)
+  321         plt.plot([0, 1], [0, 1], 'k--', label='Random Classifier')
+  322         plt.xlabel('False Positive Rate')
+  323         plt.ylabel('True Positive Rate')
+  324         plt.title('ROC Curve - Candidate Offer Prediction')
+  325         plt.legend()
+  326         plt.grid(alpha=0.3)
+  327         plt.tight_layout()
+  328         plt.savefig('roc_curve.png', dpi=300, bbox_inches='tight')
+  329         print(f"ROC curve saved to roc_curve.png")
+  330         plt.close()
+  331
+  332     def plot_calibration_curve(self):
+  333         """Plot calibration curve to assess probability quality"""
+  334         if not hasattr(self, 'y_test'):
+  335             raise ValueError("Model must be trained first")
+  336
+  337         fraction_of_positives, mean_predicted_value = calibration_curve(
+  338             self.y_test, self.y_test_pred_proba, n_bins=10
+  339         )
+  340
+  341         plt.figure(figsize=(8, 6))
+  342         plt.plot(mean_predicted_value, fraction_of_positives, 's-', label='Logistic Regression')
+  343         plt.plot([0, 1], [0, 1], 'k--', label='Perfectly Calibrated')
+  344         plt.xlabel('Mean Predicted Probability')
+  345         plt.ylabel('Fraction of Positives')
+  346         plt.title('Calibration Curve - Probability Quality')
+  347         plt.legend()
+  348         plt.grid(alpha=0.3)
+  349         plt.tight_layout()
+  350         plt.savefig('calibration_curve.png', dpi=300, bbox_inches='tight')
+  351         print(f"Calibration curve saved to calibration_curve.png")
+  352         plt.close()
+  353
+  354     def plot_score_distribution(self):
+  355         """Plot distribution of predicted probabilities"""
+  356         if not hasattr(self, 'y_test'):
+  357             raise ValueError("Model must be trained first")
+  358
+  359         plt.figure(figsize=(10, 6))
+  360
+  361         # Plot for offers vs no offers
+  362         offers = self.y_test_pred_proba[self.y_test == 1]
+  363         no_offers = self.y_test_pred_proba[self.y_test == 0]
+  364
+  365         plt.hist(no_offers, bins=30, alpha=0.6, label='No Offer', color='red', density=True)
+  366         plt.hist(offers, bins=30, alpha=0.6, label='Offer', color='green', density=True)
+  367
+  368         plt.xlabel('Predicted Offer Probability')
+  369         plt.ylabel('Density')
+  370         plt.title('Distribution of Predicted Probabilities by Outcome')
+  371         plt.legend()
+  372         plt.grid(alpha=0.3)
+  373         plt.tight_layout()
+  374         plt.savefig('score_distribution.png', dpi=300, bbox_inches='tight')
+  375         print(f"Score distribution plot saved to score_distribution.png")
+  376         plt.close()
+  377
+  378     def predict(self, df: pd.DataFrame) -> pd.DataFrame:
+  379         """
+  380         Make predictions for new candidates
+  381         Returns DataFrame with predictions
+  382         """
+  383         if self.model is None:
+  384             raise ValueError("Model must be trained first")
+  385
+  386         # Engineer features
+  387         df_processed = self.engineer_features(df)
+  388
+  389         # Select features
+  390         X = df_processed[self.feature_names]
+  391         X = X.fillna(X.median())
+  392
+  393         # Scale
+  394         X_scaled = self.scaler.transform(X)
+  395
+  396         # Predict
+  397         probabilities = self.model.predict_proba(X_scaled)[:, 1]
+  398
+  399         # Add to dataframe
+  400         df_results = df.copy()
+  401         df_results['offer_probability'] = probabilities
+  402
+  403         return df_results
+  404
+  405     def predict_with_details(self, df: pd.DataFrame) -> List[PredictionResult]:
+  406         """
+  407         Make detailed predictions with percentile ranks and confidence intervals
+  408         """
+  409         if self.model is None:
+  410             raise ValueError("Model must be trained first")
+  411
+  412         # Get predictions
+  413         df_results = self.predict(df)
+  414         probabilities = df_results['offer_probability'].values
+  415
+  416         # Calculate percentile ranks
+  417         percentiles = [
+  418             (probabilities < prob).sum() / len(probabilities) * 100
+  419             for prob in probabilities
+  420         ]
+  421
+  422         # Bootstrap confidence intervals (simplified)
+  423         ci_lower = np.maximum(probabilities - 0.1, 0)  # Simplified CI
+  424         ci_upper = np.minimum(probabilities + 0.1, 1)
+  425
+  426         # Generate predictions
+  427         results = []
+  428         for idx, row in df_results.iterrows():
+  429             prob = probabilities[idx]
+  430             percentile = percentiles[idx]
+  431
+  432             # Recommendation based on probability
+  433             if prob >= 0.75:
+  434                 recommendation = "Strong Proceed"
+  435             elif prob >= 0.60:
+  436                 recommendation = "Proceed"
+  437             elif prob >= 0.40:
+  438                 recommendation = "Borderline - Discuss"
+  439             else:
+  440                 recommendation = "Do Not Proceed"
+  441
+  442             # Get feature contributions (top positive and negative)
+  443             df_processed = self.engineer_features(df.iloc[[idx]])
+  444             X = df_processed[self.feature_names].fillna(df_processed[self.feature_names].median())
+  445             X_scaled = self.scaler.transform(X)
+  446
+  447             contributions = X_scaled[0] * self.model.coef_[0]
+  448             feature_contrib = list(zip(self.feature_names, contributions))
+  449             feature_contrib_sorted = sorted(feature_contrib, key=lambda x: abs(x[1]), reverse=True)
+  450
+  451             top_positive = [(f, c) for f, c in feature_contrib_sorted if c > 0][:3]
+  452             top_negative = [(f, c) for f, c in feature_contrib_sorted if c < 0][:3]
+  453
+  454             result = PredictionResult(
+  455                 candidate_id=row['candidate_id'],
+  456                 offer_probability=prob,
+  457                 percentile_rank=percentile,
+  458                 confidence_interval_lower=ci_lower[idx],
+  459                 confidence_interval_upper=ci_upper[idx],
+  460                 top_positive_features=top_positive,
+  461                 top_negative_features=top_negative,
+  462                 recommendation=recommendation
+  463             )
+  464
+  465             results.append(result)
+  466
+  467         return results
+  468
+  469     def save_model(self, filepath: str = 'candidate_assessment_model.pkl'):
+  470         """Save trained model to disk"""
+  471         if self.model is None:
+  472             raise ValueError("Model must be trained first")
+  473
+  474         model_data = {
+  475             'model': self.model,
+  476             'scaler': self.scaler,
+  477             'feature_names': self.feature_names,
+  478             'feature_importance': self.feature_importance,
+  479             'training_date': self.training_date,
+  480             'model_metrics': self.model_metrics
+  481         }
+  482
+  483         with open(filepath, 'wb') as f:
+  484             pickle.dump(model_data, f)
+  485
+  486         print(f"Model saved to {filepath}")
+  487
+  488     def load_model(self, filepath: str = 'candidate_assessment_model.pkl'):
+  489         """Load trained model from disk"""
+  490         with open(filepath, 'rb') as f:
+  491             model_data = pickle.load(f)
+  492
+  493         self.model = model_data['model']
+  494         self.scaler = model_data['scaler']
+  495         self.feature_names = model_data['feature_names']
+  496         self.feature_importance = model_data['feature_importance']
+  497         self.training_date = model_data['training_date']
+  498         self.model_metrics = model_data['model_metrics']
+  499
+  500         print(f"Model loaded from {filepath}")
+  501         print(f"Model trained on: {self.training_date}")
+  502         print(f"Test AUC: {self.model_metrics.get('test_auc', 'N/A')}")
+  503
+  504
+  505 if __name__ == "__main__":
+  506     # Load training data
+  507     print("Loading training data...")
+  508     df = pd.read_csv('ai_teams_training_data.csv')
+  509
+  510     # Initialize and train model
+  511     model = CandidateAssessmentModel()
+  512     model.train(df, test_size=0.2, random_state=42)
+  513
+  514     # Generate visualizations
+  515     print("\nGenerating visualizations...")
+  516     model.plot_feature_importance(top_n=20)
+  517     model.plot_roc_curve()
+  518     model.plot_calibration_curve()
+  519     model.plot_score_distribution()
+  520
+  521     # Print top features
+  522     print("\n" + "=" * 80)
+  523     print("TOP 15 MOST IMPORTANT FEATURES")
+  524     print("=" * 80)
+  525     print(model.feature_importance.head(15).to_string(index=False))
+  526
+  527     # Save model
+  528     model.save_model()
